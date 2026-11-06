@@ -79,6 +79,19 @@
 #     the proxy's own address (optionally always). A session ends when the
 #     control connection closes, when it is idle, or on shutdown; session limit.
 #
+#   Robustness details
+#   - Reject destination names that are empty or contain control characters or
+#     whitespace (after UTF-8 decoding), and escape non-printable characters in
+#     log lines, so a peer cannot forge log entries.
+#   - When a name resolves to several addresses, interleave the IP families
+#     (RFC 8305 style: v6, v4, v6, ...) and try at most four of them. The UDP
+#     forwarders fall back to the next address on failures the local stack
+#     reports immediately (socket creation / connect / sendto errors) and
+#     remember the address that worked. Connections to the upstream SOCKS5 server
+#     use asyncio's happy-eyeballs.
+#   - The CLI reports startup errors (e.g. port in use) as one line on stderr,
+#     closes the loop and exits with a non-zero status.
+#
 #   Also add a small argparse CLI, signal-based graceful shutdown, and put a
 #   credit line naming the generating model at the top of the file.
 # =============================================================================
@@ -272,12 +285,44 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
+def _is_safe_name(name: str) -> bool:
+    """A usable destination name: not empty, no control characters, no whitespace.
+
+    Applied to the *decoded* text.  Underscores, hyphens and non-ASCII (IDN)
+    letters are fine; newlines, NULs, tabs, spaces and other invisible
+    characters are not (they would forge log lines and are never valid in a
+    host name).
+    """
+    return bool(name) and name.isprintable() and " " not in name
+
+
+def _interleave_families(addresses: list) -> list:
+    """Alternate IP families, keeping the original order inside each family.
+
+    getaddrinfo() lists addresses in preference order, often several IPv6 ones
+    first.  Trying only the first few of those on a host without working IPv6
+    would never reach IPv4 (compare RFC 8305, section 4).
+    """
+    if not addresses:
+        return []
+    first = addresses[0].version
+    a = [x for x in addresses if x.version == first]
+    b = [x for x in addresses if x.version != first]
+    out = []
+    for i in range(max(len(a), len(b))):
+        if i < len(a):
+            out.append(a[i])
+        if i < len(b):
+            out.append(b[i])
+    return out
+
+
 def _check_target(host: str, port: int) -> Tuple[str, int]:
     host = str(host).strip()
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
-    if not host:
-        raise ValueError("target host must not be empty")
+    if not _is_safe_name(host):
+        raise ValueError(f"invalid host name: {host!r}")
     if not 0 < int(port) < 65536:
         raise ValueError(f"invalid target port: {port}")
     return host, int(port)
@@ -408,14 +453,16 @@ Resolver = Callable[[str], Awaitable[Sequence[str]]]
 # Shared datagram protocol
 # --------------------------------------------------------------------------- #
 class _UdpProtocol(asyncio.DatagramProtocol):
-    def __init__(self, on_datagram):
+    def __init__(self, on_datagram, on_error=None):
         self._on_datagram = on_datagram
+        self._on_error = on_error
 
     def datagram_received(self, data, addr):
         self._on_datagram(data, addr)
 
     def error_received(self, exc):  # ICMP errors etc.: UDP is best effort
-        pass
+        if self._on_error is not None:
+            self._on_error(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -461,6 +508,9 @@ class _Service:
     # -- logging ------------------------------------------------------------ #
     def log(self, message: str) -> None:
         if self.verbose:
+            if not message.isprintable():  # peer-controlled text must not forge log lines
+                message = "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii")
+                                  for c in message)
             print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
 
     # -- name resolution + block list --------------------------------------- #
@@ -485,7 +535,7 @@ class _Service:
         allowed = [_unmap(c) for c in candidates if not self.block.is_ip_blocked(c)]
         if not allowed:
             raise _Reject(REP_NOT_ALLOWED, "address is blocked")
-        return allowed
+        return _interleave_families(allowed)
 
     # -- TCP listening / per-connection task -------------------------------- #
     async def _listen(self, addr, port: int, backlog: int, what: str) -> None:
@@ -607,6 +657,8 @@ def _parse_udp_header(data: bytes):
             host = raw.decode("utf-8")
         except UnicodeDecodeError:
             return None
+        if not _is_safe_name(host):
+            return None
         ip = _parse_ip(host)
         off = 5 + n
     else:
@@ -645,6 +697,7 @@ class _UdpRelay:
         self._peers = _LRUSet(1024)
         self._blocked_logged = _LRUSet(256)
         self._dns: dict = {}
+        self._send_error: Optional[BaseException] = None
         self._tasks: set = set()
         self._closed = False
         self._loop = asyncio.get_running_loop()
@@ -728,19 +781,30 @@ class _UdpRelay:
         now = self._loop.time()
         hit = self._dns.get(host)
         if hit is not None and hit[0] > now:
-            ip = hit[1]
+            ips = hit[1]
         else:
             try:
-                ips = await self._srv.resolve_allowed(host, None)
+                ips = (await self._srv.resolve_allowed(host, None))[:MAX_CONNECT_ATTEMPTS]
             except _Reject as rej:
                 if rej.code == REP_NOT_ALLOWED:
                     self._log_blocked(host, port)
                 return
-            ip = _unmap(ips[0])
             if len(self._dns) >= self.DNS_CACHE_MAX:
                 self._dns.clear()
-            self._dns[host] = (now + self.DNS_TTL, ip)
-        self._forward(ip, port, payload, host)
+            self._dns[host] = (now + self.DNS_TTL, ips)
+        # Use the first address the local stack accepts (e.g. skip IPv6 on a host
+        # without IPv6) and remember it for the next datagrams.
+        for ip in list(ips):
+            if self._closed:
+                return
+            tr = self._remote.get(ip.version) or await self._ensure_remote(ip.version)
+            if tr is None:
+                continue
+            if self._send(tr, ip, port, payload, host):
+                if ips[0] != ip:
+                    ips.remove(ip)
+                    ips.insert(0, ip)
+                return
 
     def _forward(self, ip, port: int, payload: bytes, host: Optional[str] = None) -> None:
         if self._closed:
@@ -767,7 +831,7 @@ class _UdpRelay:
             if tr is None:
                 try:
                     tr, _ = await self._loop.create_datagram_endpoint(
-                        lambda: _UdpProtocol(self._on_remote_datagram),
+                        lambda: _UdpProtocol(self._on_remote_datagram, self._on_remote_error),
                         local_addr=("0.0.0.0" if version == 4 else "::", 0),
                     )
                 except OSError:
@@ -778,12 +842,20 @@ class _UdpRelay:
                 self._remote[version] = tr
             return tr
 
-    def _send(self, tr, ip, port: int, payload: bytes, host: Optional[str]) -> None:
+    def _send(self, tr, ip, port: int, payload: bytes, host: Optional[str]) -> bool:
+        """Send one datagram; False if the local stack refused it right away."""
+        self._send_error = None
+        tr.sendto(payload, (str(ip), port))  # asyncio reports immediate errors via error_received
+        if self._send_error is not None:
+            return False
         if self._peers.add((ip, port)):
             target = _fmt_host(host, port) if host else _fmt_host(str(ip), port)
             self._srv.log(f"{self._who} UDP -> {target} ({_fmt_host(str(ip), port)})")
-        tr.sendto(payload, (str(ip), port))
         self.up += len(payload)
+        return True
+
+    def _on_remote_error(self, exc: BaseException) -> None:
+        self._send_error = exc
 
     def _log_blocked(self, host: str, port: int) -> None:
         if self._blocked_logged.add((host, port)):
@@ -876,9 +948,11 @@ class Socks5Server(_Service):
             n = (await reader.readexactly(1))[0]
             raw = await reader.readexactly(n) if n else b""
             try:
-                host = raw.decode("utf-8") or None
+                host = raw.decode("utf-8")
             except UnicodeDecodeError:
                 host = None
+            if host is not None and not _is_safe_name(host):
+                host = None  # empty, control characters or whitespace: not a host name
             if host is not None:
                 ip = _parse_ip(host)  # IP literal sent as a domain name
         else:
@@ -888,6 +962,7 @@ class Socks5Server(_Service):
 
         if host is None:
             await self._reply(writer, REP_GENERAL_FAILURE)
+            self.log(f"{_fmt_addr(writer.get_extra_info('peername'))} invalid destination name in request")
             return None
         if cmd not in (CMD_CONNECT, CMD_UDP_ASSOCIATE):  # incl. BIND
             await self._reply(writer, REP_COMMAND_NOT_SUPPORTED)
@@ -1126,13 +1201,13 @@ class UdpForwarder(_UdpFrontend):
                     raise _Reject(cached[2], cached[3])
                 return cached[1]
             try:
-                ip = (await self.resolve_allowed(self._host, self._ip))[0]
+                addresses = (await self.resolve_allowed(self._host, self._ip))[:MAX_CONNECT_ATTEMPTS]
             except _Reject as rej:
                 self._target_cache = (loop.time() + self.TARGET_FAIL_TTL, None, rej.code, rej.detail)
                 self.log(f"UDP target {_fmt_host(self._host, self._port)} REFUSED ({rej.detail})")
                 raise
-            self._target_cache = (loop.time() + self.TARGET_TTL, ip, 0, "")
-            return ip
+            self._target_cache = (loop.time() + self.TARGET_TTL, addresses, 0, "")
+            return addresses
 
     # -- client -> target --------------------------------------------------- #
     def _on_datagram(self, data: bytes, addr) -> None:
@@ -1162,11 +1237,23 @@ class UdpForwarder(_UdpFrontend):
         who = _fmt_addr(session.client_addr)
         target = _fmt_host(self._host, self._port)
         try:
-            ip = await self._resolve_target()
-            transport, _ = await loop.create_datagram_endpoint(
-                lambda: _UdpProtocol(lambda data, _addr: self._on_upstream(session, data)),
-                remote_addr=(str(ip), self._port),
-            )
+            addresses = await self._resolve_target()
+            transport = None
+            last_exc: BaseException = OSError("no address to connect to")
+            for ip in list(addresses):  # first address the local stack accepts (connect() fails fast)
+                try:
+                    transport, _ = await loop.create_datagram_endpoint(
+                        lambda: _UdpProtocol(lambda data, _addr: self._on_upstream(session, data)),
+                        remote_addr=(str(ip), self._port),
+                    )
+                    break
+                except OSError as exc:
+                    last_exc = exc
+            if transport is None:
+                raise last_exc
+            if addresses[0] != ip:  # remember what works for the next sessions
+                addresses.remove(ip)
+                addresses.insert(0, ip)
         except asyncio.CancelledError:
             self._sessions.pop(session.key, None)
             raise
@@ -1328,7 +1415,7 @@ class TcpForwarderViaSocks5(_Service):
         via = _fmt_host(self._socks_host, self._socks_port)
         try:
             up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(self._socks_host, self._socks_port), self.connect_timeout)
+                asyncio.open_connection(self._socks_host, self._socks_port, happy_eyeballs_delay=0.25), self.connect_timeout)
         except (OSError, asyncio.TimeoutError) as exc:
             self.log(f"{who} -> {target} via {via} FAILED (cannot reach SOCKS5 server: {_describe(exc)})")
             return
@@ -1445,7 +1532,7 @@ class UdpForwarderViaSocks5(_UdpFrontend):
     async def _open(self, session: _ViaSession) -> None:
         loop = asyncio.get_running_loop()
         session.ctrl_reader, session.ctrl_writer = await asyncio.wait_for(
-            asyncio.open_connection(self._socks_host, self._socks_port), self.connect_timeout)
+            asyncio.open_connection(self._socks_host, self._socks_port, happy_eyeballs_delay=0.25), self.connect_timeout)
         _tune_socket(session.ctrl_writer)
         # DST.ADDR/PORT 0.0.0.0:0: "I do not know from where I will send" (widely accepted)
         bnd_host, bnd_port = await asyncio.wait_for(
@@ -1904,7 +1991,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                       verbose=args.verbose, idle_timeout=args.idle_timeout,
                                       max_sessions=args.max_sessions,
                                       use_server_address=args.use_server_address)
-    handle = loop.run_until_complete(coro)
+    try:
+        handle = loop.run_until_complete(coro)
+    except (OSError, ValueError) as exc:  # e.g. port already in use, bad host name
+        print(f"{p.prog}: cannot start: {exc}", file=sys.stderr)
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        return 1
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, loop.stop)
