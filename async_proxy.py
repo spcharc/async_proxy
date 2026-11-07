@@ -89,6 +89,11 @@
 #     reports immediately (socket creation / connect / sendto errors) and
 #     remember the address that worked. Connections to the upstream SOCKS5 server
 #     use asyncio's happy-eyeballs.
+#   - A custom resolver may raise anything: OSError / timeout => "host
+#     unreachable", any other exception or junk result => "general failure",
+#     logged. No unexpected exception (resolver, socket creation, logging) may
+#     leave a half-open UDP session, a dead reaper task or a broken handler
+#     behind; failing to write a log line must never affect the proxy.
 #   - The CLI reports startup errors (e.g. port in use) as one line on stderr,
 #     closes the loop and exits with a non-zero status.
 #
@@ -135,7 +140,8 @@ Note on DNS: the standard library has no asynchronous resolver.  By default
 domain names are resolved with ``loop.getaddrinfo()``, which asyncio runs in
 its own internal default executor.  This module never creates threads or
 subprocesses itself; if you need strictly thread-free resolution, pass your
-own coroutine function through the ``resolver`` parameter.
+own coroutine function through the ``resolver`` parameter (see
+:func:`serve_socks5` for its error contract).
 """
 from __future__ import annotations
 
@@ -511,7 +517,10 @@ class _Service:
             if not message.isprintable():  # peer-controlled text must not forge log lines
                 message = "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii")
                                   for c in message)
-            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+            try:
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+            except (OSError, ValueError):  # stdout closed / broken pipe: logging is best effort
+                pass
 
     # -- name resolution + block list --------------------------------------- #
     async def resolve_allowed(self, host: str, ip) -> list:
@@ -523,13 +532,17 @@ class _Service:
         else:
             try:
                 raw = await asyncio.wait_for(self._resolver(host), self.dns_timeout)
+                if isinstance(raw, str):  # a single address instead of a list
+                    raw = [raw]
+                candidates = []
+                for item in raw:
+                    parsed = _parse_ip(item)
+                    if parsed is not None and parsed not in candidates:
+                        candidates.append(parsed)
             except (asyncio.TimeoutError, OSError, UnicodeError, ValueError) as exc:
                 raise _Reject(REP_HOST_UNREACHABLE, f"resolution failed: {_describe(exc)}")
-            candidates = []
-            for item in raw:
-                parsed = _parse_ip(item)
-                if parsed is not None and parsed not in candidates:
-                    candidates.append(parsed)
+            except Exception as exc:  # a custom resolver may raise anything (or return junk)
+                raise _Reject(REP_GENERAL_FAILURE, f"resolver error: {exc!r}")
             if not candidates:
                 raise _Reject(REP_HOST_UNREACHABLE, "no addresses")
         allowed = [_unmap(c) for c in candidates if not self.block.is_ip_blocked(c)]
@@ -749,8 +762,8 @@ class _UdpRelay:
 
         def _done(t):
             self._tasks.discard(t)
-            if not t.cancelled():
-                t.exception()  # mark as retrieved
+            if not t.cancelled() and t.exception() is not None:
+                self._srv.log(f"{self._who} UDP internal error: {t.exception()!r}")
 
         task.add_done_callback(_done)
 
@@ -786,8 +799,8 @@ class _UdpRelay:
             try:
                 ips = (await self._srv.resolve_allowed(host, None))[:MAX_CONNECT_ATTEMPTS]
             except _Reject as rej:
-                if rej.code == REP_NOT_ALLOWED:
-                    self._log_blocked(host, port)
+                self._log_blocked(host, port, "BLOCKED" if rej.code == REP_NOT_ALLOWED
+                                  else f"FAILED ({rej.detail})")
                 return
             if len(self._dns) >= self.DNS_CACHE_MAX:
                 self._dns.clear()
@@ -857,9 +870,9 @@ class _UdpRelay:
     def _on_remote_error(self, exc: BaseException) -> None:
         self._send_error = exc
 
-    def _log_blocked(self, host: str, port: int) -> None:
-        if self._blocked_logged.add((host, port)):
-            self._srv.log(f"{self._who} UDP -> {_fmt_host(host, port)} BLOCKED")
+    def _log_blocked(self, host: str, port: int, tag: str = "BLOCKED") -> None:
+        if self._blocked_logged.add((host, port, tag)):  # log each (destination, reason) once
+            self._srv.log(f"{self._who} UDP -> {_fmt_host(host, port)} {tag}")
 
     # -- remote -> client --------------------------------------------------- #
     def _on_remote_datagram(self, data: bytes, addr) -> None:
@@ -1140,8 +1153,8 @@ class _UdpFrontend(_Service):
 
         def _done(t):
             self._tasks.discard(t)
-            if not t.cancelled():
-                t.exception()  # mark as retrieved
+            if not t.cancelled() and t.exception() is not None:
+                self.log(f"internal error: {t.exception()!r}")
 
         task.add_done_callback(_done)
 
@@ -1236,9 +1249,10 @@ class UdpForwarder(_UdpFrontend):
         loop = asyncio.get_running_loop()
         who = _fmt_addr(session.client_addr)
         target = _fmt_host(self._host, self._port)
+        transport = None
+        committed = False  # True once the session owns the transport and is usable
         try:
             addresses = await self._resolve_target()
-            transport = None
             last_exc: BaseException = OSError("no address to connect to")
             for ip in list(addresses):  # first address the local stack accepts (connect() fails fast)
                 try:
@@ -1254,24 +1268,27 @@ class UdpForwarder(_UdpFrontend):
             if addresses[0] != ip:  # remember what works for the next sessions
                 addresses.remove(ip)
                 addresses.insert(0, ip)
+            if self._closed or self._sessions.get(session.key) is not session:
+                return  # closed meanwhile; the finally clause releases the socket
+            session.transport = transport
+            committed = True
+            self.log(f"{who} UDP -> {target} OK ({_fmt_host(str(ip), self._port)})")
+            for data in session.backlog:
+                transport.sendto(data)
+                session.up += len(data)
+            session.backlog.clear()
         except asyncio.CancelledError:
-            self._sessions.pop(session.key, None)
             raise
-        except (_Reject, OSError) as exc:
-            if self._sessions.get(session.key) is session:
-                del self._sessions[session.key]
-            if isinstance(exc, OSError):
-                self.log(f"{who} UDP -> {target} FAILED ({_describe(exc)})")
-            return
-        if self._closed or self._sessions.get(session.key) is not session:
-            transport.close()
-            return
-        session.transport = transport
-        self.log(f"{who} UDP -> {target} OK ({_fmt_host(str(ip), self._port)})")
-        for data in session.backlog:
-            transport.sendto(data)
-            session.up += len(data)
-        session.backlog.clear()
+        except _Reject:
+            pass  # already logged by _resolve_target
+        except Exception as exc:  # OSError, or anything unexpected
+            self.log(f"{who} UDP -> {target} FAILED ({_describe(exc)})")
+        finally:
+            if not committed:  # whatever went wrong: no half-open session, no leaked socket
+                if transport is not None:
+                    transport.close()
+                if self._sessions.get(session.key) is session:
+                    del self._sessions[session.key]
 
     # -- target -> client --------------------------------------------------- #
     def _on_upstream(self, session: _UdpSession, data: bytes) -> None:
@@ -1298,10 +1315,13 @@ class UdpForwarder(_UdpFrontend):
         interval = min(5.0, max(0.1, self.idle_timeout / 4))
         while True:
             await asyncio.sleep(interval)
-            now = loop.time()
-            for session in [s for s in self._sessions.values()
-                            if s.transport is not None and now - s.last >= self.idle_timeout]:
-                self._drop_session(session, "idle timeout")
+            try:
+                now = loop.time()
+                for session in [s for s in self._sessions.values()
+                                if s.transport is not None and now - s.last >= self.idle_timeout]:
+                    self._drop_session(session, "idle timeout")
+            except Exception as exc:  # a dead reaper would leak sessions forever
+                self.log(f"internal error while expiring sessions: {exc!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1594,6 +1614,8 @@ class UdpForwarderViaSocks5(_UdpFrontend):
             self.log(f"{who} UDP -> {target} via {via} FAILED ({exc})")
         except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
             self.log(f"{who} UDP -> {target} via {via} FAILED ({_describe(exc)})")
+        except Exception as exc:
+            self.log(f"{who} UDP -> {target} via {via} internal error: {exc!r}")
         finally:
             if self._sessions.get(session.key) is session:
                 del self._sessions[session.key]
@@ -1659,7 +1681,13 @@ async def serve_socks5(
         extra descriptors).
     resolver:
         Optional ``async def resolver(host) -> list_of_ip_strings`` replacing
-        the default ``loop.getaddrinfo`` based lookup.
+        the default ``loop.getaddrinfo`` based lookup.  Error contract: raise
+        ``OSError`` (e.g. ``socket.gaierror``) or ``asyncio.TimeoutError`` when
+        the name cannot be resolved (reply 0x04, host unreachable); any other
+        exception, or a result that is not an iterable of IP addresses, is
+        treated as a resolver bug (reply 0x01, general failure) and logged.
+        An empty result means "no such host" (0x04).  The lookup is also cut
+        off after ``dns_timeout`` seconds.
 
     Returns
     -------
