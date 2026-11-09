@@ -94,6 +94,12 @@
 #     logged. No unexpected exception (resolver, socket creation, logging) may
 #     leave a half-open UDP session, a dead reaper task or a broken handler
 #     behind; failing to write a log line must never affect the proxy.
+#   - close() must tear down every connection, including ones accepted at the
+#     very moment of shutdown: register connections synchronously from the
+#     accept callback (not from inside the handler task, which starts a loop
+#     iteration later), refuse connections that arrive once closing has begun,
+#     and close the writers of handlers that were cancelled before their first
+#     step. Validate port ranges up front (ValueError, never OverflowError).
 #   - The CLI reports startup errors (e.g. port in use) as one line on stderr,
 #     closes the loop and exits with a non-zero status.
 #
@@ -323,6 +329,12 @@ def _interleave_families(addresses: list) -> list:
     return out
 
 
+def _check_listen_port(port) -> None:
+    """Fail early and clearly (asyncio would raise OverflowError from bind())."""
+    if isinstance(port, int) and not 0 <= port <= 65535:
+        raise ValueError(f"invalid listen port: {port} (expected 0-65535)")
+
+
 def _check_target(host: str, port: int) -> Tuple[str, int]:
     host = str(host).strip()
     if host.startswith("[") and host.endswith("]"):
@@ -488,7 +500,9 @@ class _Service:
         self.max_connections = max_connections
         self._resolver: Resolver = resolver or _default_resolver
         self._server: Optional[asyncio.AbstractServer] = None
-        self._tasks: set = set()
+        self._tasks: set = set()     # handler tasks of live connections
+        self._conns: set = set()     # writers of live connections (registered at accept time)
+        self._closing = False
 
     # -- public API --------------------------------------------------------- #
     @property
@@ -497,14 +511,31 @@ class _Service:
         return self._server.sockets if self._server else ()
 
     async def close(self) -> None:
-        """Stop listening and gracefully tear down every live connection."""
+        """Stop listening and gracefully tear down every live connection.
+
+        This includes connections accepted at the very moment of shutdown: they
+        are registered synchronously by :meth:`_on_connect`, and connections
+        that show up after this method started are refused there.
+        """
+        self._closing = True  # from now on _on_connect refuses new connections
         if self._server is not None:
             self._server.close()  # stop accepting
-        tasks = list(self._tasks)
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        while self._tasks:
+            tasks = [t for t in self._tasks if not t.done()]
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                # Finished tasks leave the set through a done-callback that needs a
+                # loop iteration (gather() of finished tasks would not yield, so
+                # without this the loop would spin forever).
+                await asyncio.sleep(0)
+        # A handler that was cancelled before its first step never reached its
+        # `finally` clause: its connection is still registered, close it here.
+        for writer in list(self._conns):
+            await _close_writer(writer, self.close_timeout)
+        self._conns.clear()
         if self._server is not None:
             try:
                 await asyncio.wait_for(self._server.wait_closed(), self.close_timeout)
@@ -552,19 +583,31 @@ class _Service:
 
     # -- TCP listening / per-connection task -------------------------------- #
     async def _listen(self, addr, port: int, backlog: int, what: str) -> None:
+        _check_listen_port(port)
         self._server = await asyncio.start_server(
-            self._on_client, addr or None, port, backlog=backlog)
+            self._on_connect, addr or None, port, backlog=backlog)
         for sock in self._server.sockets:
             self.log(f"{what} listening on {_fmt_addr(sock.getsockname())}")
 
     async def _handle(self, reader, writer, who: str) -> None:
         raise NotImplementedError
 
+    def _on_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Called by asyncio, synchronously, the moment a connection is accepted.
+
+        The connection is registered *here* and not inside the handler task: a
+        task only starts one loop iteration later, and close() must not miss
+        connections that were accepted in that gap.
+        """
+        if self._closing:  # arrived while shutting down
+            writer.close()
+            return
+        self._conns.add(writer)
+        task = asyncio.get_running_loop().create_task(self._on_client(reader, writer))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        task = asyncio.current_task()
-        if task is not None:
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
         who = _fmt_addr(writer.get_extra_info("peername"))
         try:
             if len(self._tasks) > self.max_connections:
@@ -579,7 +622,10 @@ class _Service:
         except Exception as exc:  # never let a bug leak out of the handler
             self.log(f"{who} internal error: {exc!r}")
         finally:
-            await _close_writer(writer, self.close_timeout)
+            try:
+                await _close_writer(writer, self.close_timeout)
+            finally:
+                self._conns.discard(writer)
 
     # -- outgoing connection + relay ---------------------------------------- #
     async def _open_upstream(self, addresses: list, port: int):
@@ -1127,6 +1173,7 @@ class _UdpFrontend(_Service):
         return (sock,) if sock is not None else ()
 
     async def _bind_udp(self, addr: Optional[str], port: int, what: str) -> None:
+        _check_listen_port(port)
         loop = asyncio.get_running_loop()
         self._listener, _ = await loop.create_datagram_endpoint(
             lambda: _UdpProtocol(self._on_datagram), local_addr=(addr or "0.0.0.0", port))
@@ -1168,6 +1215,7 @@ class _UdpFrontend(_Service):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._drop_all_sessions()
+        self._sessions.clear()
         if self._listener is not None:
             self._listener.close()
         await asyncio.sleep(0)  # let the loop actually close the sockets
@@ -1931,10 +1979,22 @@ async def forward_udp_via_socks5(
 # --------------------------------------------------------------------------- #
 # Command line
 # --------------------------------------------------------------------------- #
+def _port(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid port: {text!r}")
+    if not 0 <= value <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be 0-65535, got {value}")
+    return value
+
+
 def _hostport(text: str) -> Tuple[str, int]:
     host, sep, port = text.rpartition(":")
     if not sep or not port.isdigit():
         raise argparse.ArgumentTypeError(f"expected HOST:PORT, got {text!r}")
+    if not host.strip("[]") or not 0 < int(port) < 65536:
+        raise argparse.ArgumentTypeError(f"invalid HOST:PORT: {text!r}")
     return host.strip("[]"), int(port)
 
 
@@ -1944,7 +2004,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     def common(sp, default_port, block=True):
         sp.add_argument("--bind", default="127.0.0.1", help="listen address (default 127.0.0.1)")
-        sp.add_argument("--port", type=int, default=default_port, help="listen port")
+        sp.add_argument("--port", type=_port, default=default_port, help="listen port")
         sp.add_argument("-v", "--verbose", action="store_true", help="log connections to stdout")
         if block:
             sp.add_argument("--block", action="append", default=[], metavar="CIDR_OR_HOST",
@@ -2021,7 +2081,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                       use_server_address=args.use_server_address)
     try:
         handle = loop.run_until_complete(coro)
-    except (OSError, ValueError) as exc:  # e.g. port already in use, bad host name
+    except (OSError, ValueError, OverflowError) as exc:  # e.g. port already in use, bad host name
         print(f"{p.prog}: cannot start: {exc}", file=sys.stderr)
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
