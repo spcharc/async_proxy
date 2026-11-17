@@ -100,6 +100,12 @@
 #     iteration later), refuse connections that arrive once closing has begun,
 #     and close the writers of handlers that were cancelled before their first
 #     step. Validate port ranges up front (ValueError, never OverflowError).
+#   - Never confuse our own timeouts with socket errors: on Python 3.11+
+#     asyncio.TimeoutError *is* the builtin TimeoutError, which is also what a
+#     dead TCP peer produces (ETIMEDOUT after keep-alive / retransmission
+#     failure) and what a failed stream re-raises on every read. A retry loop
+#     that treats it as "our wait_for expired" would spin without ever yielding
+#     and freeze the whole event loop.
 #   - The CLI reports startup errors (e.g. port in use) as one line on stderr,
 #     closes the loop and exits with a non-zero status.
 #
@@ -290,8 +296,8 @@ def _fmt_addr(addr) -> str:
 
 
 def _describe(exc: BaseException) -> str:
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return "timeout"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and getattr(exc, "errno", None) is None:
+        return "timeout"  # ours; a socket's TimeoutError carries errno ETIMEDOUT and is shown in full
     if isinstance(exc, asyncio.IncompleteReadError):
         return "peer closed during handshake"
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
@@ -374,6 +380,10 @@ async def _close_writer(writer: Optional[asyncio.StreamWriter], timeout: float) 
         raise
     except Exception:
         transport.abort()
+
+
+class _IdleTimeout(asyncio.TimeoutError):
+    """Our own idle timeout (as opposed to a TimeoutError raised by the socket)."""
 
 
 class _Reject(Exception):
@@ -655,8 +665,7 @@ class _Service:
         reason = "closed"
         for res in results:
             if isinstance(res, BaseException) and not isinstance(res, asyncio.CancelledError):
-                reason = "idle timeout" if isinstance(res, (asyncio.TimeoutError, TimeoutError)) \
-                    else _describe(res)
+                reason = "idle timeout" if isinstance(res, _IdleTimeout) else _describe(res)
                 break
         return stats[0], stats[1], reason
 
@@ -665,17 +674,31 @@ class _Service:
         while True:
             remaining = activity.remaining()
             if remaining <= 0:
-                raise asyncio.TimeoutError()
+                raise _IdleTimeout("idle")
             try:
                 data = await asyncio.wait_for(reader.read(BUFSIZE), remaining)
             except asyncio.TimeoutError:
-                continue  # the other direction may have extended the deadline
+                # Either our wait_for expired (the other direction may have extended
+                # the deadline: retry), or the stream itself died with a real
+                # TimeoutError (ETIMEDOUT after a keep-alive / retransmission failure).
+                # On Python 3.11+ both are the same class, and a failed stream re-raises
+                # its error immediately on every read(): retrying would spin forever
+                # without yielding to the event loop.
+                failure = reader.exception()
+                if failure is not None:
+                    raise failure
+                continue
             if not data:
                 break
             activity.touch()
             writer.write(data)
             # A peer that stops reading must not pin us (and our memory) forever.
-            await asyncio.wait_for(writer.drain(), self.idle_timeout)
+            try:
+                await asyncio.wait_for(writer.drain(), self.idle_timeout)
+            except asyncio.TimeoutError as exc:
+                if getattr(exc, "errno", None) is None:  # our wait_for, not a socket error
+                    raise _IdleTimeout("peer stopped reading") from None
+                raise
             activity.touch()
             stats[idx] += len(data)
         # Propagate EOF as a half-close; the other direction may still be active.
