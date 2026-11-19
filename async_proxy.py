@@ -89,9 +89,10 @@
 #     reports immediately (socket creation / connect / sendto errors) and
 #     remember the address that worked. Connections to the upstream SOCKS5 server
 #     use asyncio's happy-eyeballs.
-#   - A custom resolver may raise anything: OSError / timeout => "host
-#     unreachable", any other exception or junk result => "general failure",
-#     logged. No unexpected exception (resolver, socket creation, logging) may
+#   - A custom resolver may raise anything and its exceptions have no known
+#     meaning: treat every exception (and any junk result) uniformly as "name
+#     could not be resolved" (host unreachable), logging type and message; do
+#     not interpret exception types. No unexpected exception (resolver, socket creation, logging) may
 #     leave a half-open UDP session, a dead reaper task or a broken handler
 #     behind; failing to write a log line must never affect the proxy.
 #   - close() must tear down every connection, including ones accepted at the
@@ -580,10 +581,13 @@ class _Service:
                     parsed = _parse_ip(item)
                     if parsed is not None and parsed not in candidates:
                         candidates.append(parsed)
-            except (asyncio.TimeoutError, OSError, UnicodeError, ValueError) as exc:
+            except Exception as exc:
+                # Deliberately no interpretation of the exception type: a custom resolver
+                # may raise anything and we cannot know what its exceptions mean (the
+                # built-in one raises gaierror, UnicodeError, ...).  Every failure, and
+                # any junk result, simply means "the name could not be resolved"; the log
+                # keeps the details.  (CancelledError is not an Exception and passes.)
                 raise _Reject(REP_HOST_UNREACHABLE, f"resolution failed: {_describe(exc)}")
-            except Exception as exc:  # a custom resolver may raise anything (or return junk)
-                raise _Reject(REP_GENERAL_FAILURE, f"resolver error: {exc!r}")
             if not candidates:
                 raise _Reject(REP_HOST_UNREACHABLE, "no addresses")
         allowed = [_unmap(c) for c in candidates if not self.block.is_ip_blocked(c)]
@@ -1752,13 +1756,15 @@ async def serve_socks5(
         extra descriptors).
     resolver:
         Optional ``async def resolver(host) -> list_of_ip_strings`` replacing
-        the default ``loop.getaddrinfo`` based lookup.  Error contract: raise
-        ``OSError`` (e.g. ``socket.gaierror``) or ``asyncio.TimeoutError`` when
-        the name cannot be resolved (reply 0x04, host unreachable); any other
-        exception, or a result that is not an iterable of IP addresses, is
-        treated as a resolver bug (reply 0x01, general failure) and logged.
-        An empty result means "no such host" (0x04).  The lookup is also cut
-        off after ``dns_timeout`` seconds.
+        the default ``loop.getaddrinfo`` based lookup.  Contract: return the
+        IP addresses of the name (an empty list means "no such host").  Any
+        exception raised by the resolver, and any result that is not an
+        iterable of IP addresses, is treated the same way: the name could not
+        be resolved (reply 0x04, host unreachable), with the exception type
+        and message in the log.  Nothing is inferred from exception types, so
+        the resolver is responsible for translating its own errors (return
+        ``[]`` for "no such host" if you want that to be quiet).  The lookup
+        is also cut off after ``dns_timeout`` seconds.
 
     Returns
     -------
